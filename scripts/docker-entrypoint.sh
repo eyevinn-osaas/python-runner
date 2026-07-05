@@ -23,6 +23,14 @@ clone_from_git() {
   # When SOURCE_URL has no credentials, this is identical to git_host.
   local git_host_public=$(echo "$git_host" | sed -E 's|^[^@]+@||')
 
+  # Extract #<ref> fragment if present, and strip it from the URL used for
+  # further parsing. Must run before /tree/ handling so repo_path extraction
+  # operates on the fragment-stripped URL.
+  if [[ "$url" == *"#"* ]]; then
+    branch="${url##*#}"
+    url="${url%#*}"
+  fi
+
   # Check if URL contains a branch reference (e.g., /tree/branch_name)
   if [[ "$url" == *"/tree/"* ]]; then
     # Extract branch name (everything after /tree/)
@@ -145,10 +153,43 @@ fi
 # Change to the usercontent directory
 cd /usercontent
 
+# SUB_PATH support — for monorepo deployments where the Python app lives
+# in a subdirectory of the cloned repo.
+if [ -n "${SUB_PATH:-}" ]; then
+  WORK_DIR="/usercontent/$SUB_PATH"
+  if [ ! -d "$WORK_DIR" ]; then
+    echo "Error: SUB_PATH directory '$WORK_DIR' does not exist"
+    exit 1
+  fi
+  echo "Using SUB_PATH: $SUB_PATH (working directory: $WORK_DIR)"
+  cd "$WORK_DIR"
+fi
+
 # Load environment variables from config service if configured
-if [ -n "$OSC_ACCESS_TOKEN" ] && [ -n "$CONFIG_SVC" ]; then
-  echo "Loading environment variables from application config service '$CONFIG_SVC'"
-  eval $(npx -y @osaas/cli@latest web config-to-env $CONFIG_SVC)
+if [ -n "${OSC_ACCESS_TOKEN:-}" ] && [ -n "${CONFIG_SVC:-}" ]; then
+  # Derive OSC environment from OSC_MCP_URL if OSC_ENV is not set explicitly
+  if [[ -z "${OSC_ENV:-}" && -n "${OSC_MCP_URL:-}" ]]; then
+    _extracted=$(echo "$OSC_MCP_URL" | sed -n 's|.*\.svc\.\([a-z]*\)\.osaas\.io.*|\1|p')
+    OSC_ENV=${_extracted:-prod}
+  fi
+  # Token refresh block (matching birme/claude-runner#14)
+  REFRESH_RESULT=$(curl -sf -X POST \
+    "https://token.svc.${OSC_ENV:-prod}.osaas.io/runner-token/refresh" \
+    -H "x-pat-jwt: $OSC_ACCESS_TOKEN" 2>&1) && \
+    OSC_ACCESS_TOKEN=$(echo "$REFRESH_RESULT" | jq -r '.token // empty') || true
+  echo "[CONFIG] Loading environment variables from config service '$CONFIG_SVC'"
+  config_env_output=$(npx -y @osaas/cli@latest web config-to-env ${OSC_ENV:+--env "$OSC_ENV"} "$CONFIG_SVC" 2>&1)
+  config_exit=$?
+  if [ $config_exit -eq 0 ]; then
+    valid_exports=$(echo "$config_env_output" | grep "^export [A-Za-z_][A-Za-z0-9_]*=")
+    if [ -n "$valid_exports" ]; then
+      eval "$valid_exports"
+      var_count=$(echo "$valid_exports" | wc -l | tr -d ' ')
+      echo "[CONFIG] Loaded $var_count environment variable(s)"
+    fi
+  else
+    echo "[CONFIG] ERROR: Failed to load config (exit $config_exit): $config_env_output" >&2
+  fi
 fi
 
 # Install Python dependencies
